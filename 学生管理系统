@@ -1,0 +1,423 @@
+# 学生信息管理系统
+
+基于 Python + SQLite 的学生信息管理系统，具备增删改查、搜索、统计、排名、导出等功能。
+
+## 功能
+- 学生信息增删改查（学号、姓名、性别、年龄、专业、成绩）
+- 按学号 / 姓名模糊搜索
+- 成绩统计（平均分、最高/最低分、及格率）
+- 成绩排名
+- 数据导出为 Excel（.xlsx）或 CSV
+
+## 技术栈
+- Python 3
+- SQLite（Python 自带，无需安装）
+- openpyxl（导出 Excel，可选）
+
+## 运行
+```bash
+python student_manager.py
+```
+
+## 数据库说明
+本项目使用 SQLite 作为存储，接口与 MySQL 高度相似。
+后续如需接入 MySQL，只需：
+1. `pip install mysql-connector-python`
+2. 把 `sqlite3.connect(...)` 替换为 `mysql.connector.connect(host=..., user=..., password=..., database=...)`
+3. SQL 语句基本不用改动
+
+## 目录结构
+```
+student_manager/
+├── student_manager.py    # 主程序
+└── README.md
+```
+
+# -*- coding: utf-8 -*-
+"""
+学生信息管理系统（Python + SQLite 版）
+========================================
+功能：
+  1. 学生信息增删改查（学号、姓名、性别、年龄、专业、成绩）
+  2. 模糊搜索（按姓名、学号）
+  3. 成绩统计（平均分、最高分、最低分、排名）
+  4. 数据导出到 Excel（.xlsx）
+  5. 命令行交互界面
+
+技术栈：
+  - Python 标准库（sqlite3 / csv / datetime / os）
+  - openpyxl（导出 Excel）
+
+说明：
+  SQLite 是 Python 自带的轻量数据库，接口与 MySQL 高度相似，
+  后续接入 MySQL 只需把 sqlite3.connect 换成 mysql.connector.connect，
+  SQL 语句基本不用改。
+
+运行方式：
+  python student_manager.py
+
+作者：刘欣怡
+"""
+
+import os
+import sqlite3
+import datetime
+import csv
+
+try:
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, Alignment, PatternFill
+    HAS_OPENPYXL = True
+except ImportError:
+    HAS_OPENPYXL = False
+
+
+# ============================================================
+# 数据库模块
+# ============================================================
+class Database:
+    """SQLite 数据库封装，接口与 MySQL 类似"""
+
+    def __init__(self, db_path="students.db"):
+        self.db_path = db_path
+        self.init_db()
+
+    def get_conn(self):
+        return sqlite3.connect(self.db_path)
+
+    def init_db(self):
+        """建表"""
+        conn = self.get_conn()
+        c = conn.cursor()
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS students (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                student_id TEXT UNIQUE NOT NULL,
+                name TEXT NOT NULL,
+                gender TEXT,
+                age INTEGER,
+                major TEXT,
+                score REAL,
+                created_at TEXT NOT NULL
+            )
+        """)
+        conn.commit()
+        conn.close()
+
+    # ---------- CRUD ----------
+    def add_student(self, student_id, name, gender, age, major, score):
+        conn = self.get_conn()
+        c = conn.cursor()
+        try:
+            c.execute(
+                "INSERT INTO students (student_id, name, gender, age, major, score, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (student_id, name, gender, age, major, score,
+                 datetime.datetime.now().isoformat())
+            )
+            conn.commit()
+            return True, "添加成功"
+        except sqlite3.IntegrityError:
+            return False, "学号已存在"
+        finally:
+            conn.close()
+
+    def delete_student(self, student_id):
+        conn = self.get_conn()
+        c = conn.cursor()
+        c.execute("DELETE FROM students WHERE student_id = ?", (student_id,))
+        conn.commit()
+        affected = c.rowcount
+        conn.close()
+        return affected > 0, "删除成功" if affected > 0 else "未找到该学号"
+
+    def update_student(self, student_id, **kwargs):
+        """按学号更新字段"""
+        if not kwargs:
+            return False, "没有要更新的字段"
+        set_sql = ", ".join([f"{k} = ?" for k in kwargs])
+        params = list(kwargs.values()) + [student_id]
+        conn = self.get_conn()
+        c = conn.cursor()
+        c.execute(f"UPDATE students SET {set_sql} WHERE student_id = ?", params)
+        conn.commit()
+        affected = c.rowcount
+        conn.close()
+        return affected > 0, "更新成功" if affected > 0 else "未找到该学号"
+
+    def get_all(self):
+        conn = self.get_conn()
+        c = conn.cursor()
+        c.execute("SELECT student_id, name, gender, age, major, score FROM students ORDER BY id")
+        rows = c.fetchall()
+        conn.close()
+        return rows
+
+    def search(self, keyword):
+        """按学号或姓名模糊搜索"""
+        conn = self.get_conn()
+        c = conn.cursor()
+        kw = f"%{keyword}%"
+        c.execute(
+            "SELECT student_id, name, gender, age, major, score FROM students "
+            "WHERE student_id LIKE ? OR name LIKE ? ORDER BY id",
+            (kw, kw)
+        )
+        rows = c.fetchall()
+        conn.close()
+        return rows
+
+    def get_by_id(self, student_id):
+        conn = self.get_conn()
+        c = conn.cursor()
+        c.execute(
+            "SELECT student_id, name, gender, age, major, score FROM students WHERE student_id = ?",
+            (student_id,)
+        )
+        row = c.fetchone()
+        conn.close()
+        return row
+
+    # ---------- 统计 ----------
+    def get_stats(self):
+        """成绩统计：人数、平均分、最高、最低、及格率"""
+        conn = self.get_conn()
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*), AVG(score), MAX(score), MIN(score) FROM students")
+        count, avg, max_s, min_s = c.fetchone()
+        pass_count = 0
+        if count and count > 0:
+            c.execute("SELECT COUNT(*) FROM students WHERE score >= 60")
+            pass_count = c.fetchone()[0]
+        conn.close()
+        if not count:
+            return None
+        return {
+            "count": count,
+            "avg": round(avg, 2),
+            "max": max_s,
+            "min": min_s,
+            "pass_rate": round(pass_count / count * 100, 1)
+        }
+
+    def get_ranking(self):
+        """按成绩降序排名"""
+        conn = self.get_conn()
+        c = conn.cursor()
+        c.execute("SELECT student_id, name, score FROM students ORDER BY score DESC")
+        rows = c.fetchall()
+        conn.close()
+        return rows
+
+
+# ============================================================
+# 导出模块
+# ============================================================
+class Exporter:
+    """导出为 Excel / CSV"""
+
+    @staticmethod
+    def to_csv(rows, filepath="students.csv"):
+        with open(filepath, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
+            writer.writerow(["学号", "姓名", "性别", "年龄", "专业", "成绩"])
+            writer.writerows(rows)
+        return filepath
+
+    @staticmethod
+    def to_excel(rows, filepath="students.xlsx"):
+        if not HAS_OPENPYXL:
+            return Exporter.to_csv(rows, filepath.replace(".xlsx", ".csv"))
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "学生信息"
+
+        headers = ["学号", "姓名", "性别", "年龄", "专业", "成绩"]
+        ws.append(headers)
+        # 表头样式
+        header_fill = PatternFill("solid", fgColor="4472C4")
+        header_font = Font(bold=True, color="FFFFFF", size=11)
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+
+        for row in rows:
+            ws.append(list(row))
+
+        # 列宽
+        widths = [14, 12, 8, 8, 20, 10]
+        for i, w in enumerate(widths, 1):
+            ws.column_dimensions[chr(64 + i)].width = w
+
+        wb.save(filepath)
+        return filepath
+
+
+# ============================================================
+# 主程序
+# ============================================================
+class StudentManagerApp:
+    HEADERS = ["学号", "姓名", "性别", "年龄", "专业", "成绩"]
+
+    def __init__(self):
+        self.db = Database()
+
+    def run(self):
+        self._print_header("📚 学生信息管理系统")
+        while True:
+            self._print_menu([
+                ("1", "添加学生"),
+                ("2", "删除学生"),
+                ("3", "修改学生信息"),
+                ("4", "查询所有学生"),
+                ("5", "搜索学生（学号/姓名）"),
+                ("6", "成绩统计"),
+                ("7", "成绩排名"),
+                ("8", "导出数据（Excel/CSV）"),
+                ("0", "退出"),
+            ])
+            choice = input("\n请选择：").strip()
+            actions = {
+                "1": self._add,
+                "2": self._delete,
+                "3": self._update,
+                "4": self._list_all,
+                "5": self._search,
+                "6": self._stats,
+                "7": self._ranking,
+                "8": self._export,
+            }
+            action = actions.get(choice)
+            if action:
+                action()
+            elif choice == "0":
+                print("   再见！")
+                break
+            else:
+                print("   输入无效，请重试。")
+
+    # ---------- 界面 ----------
+    def _print_header(self, title):
+        print("\n" + "=" * 52)
+        print(f"   {title}")
+        print("=" * 52)
+
+    def _print_menu(self, items):
+        for key, desc in items:
+            print(f"   [{key}] {desc}")
+
+    def _print_rows(self, rows):
+        if not rows:
+            print("   （无数据）")
+            return
+        # 表头
+        print("   " + "-" * 48)
+        print("   " + "  ".join(f"{h:<6}" for h in self.HEADERS))
+        print("   " + "-" * 48)
+        for row in rows:
+            print("   " + "  ".join(str(f"{str(v):<6}") if v is not None else "  -     " for v in row))
+        print("   " + "-" * 48)
+
+    # ---------- 操作 ----------
+    def _ask(self, prompt):
+        return input(prompt).strip()
+
+    def _add(self):
+        print("\n   ---- 添加学生 ----")
+        student_id = self._ask("   学号：")
+        if not student_id:
+            print("   ❌ 学号不能为空")
+            return
+        name = self._ask("   姓名：")
+        gender = self._ask("   性别（男/女）：") or None
+        age = self._ask("   年龄：")
+        major = self._ask("   专业：")
+        score = self._ask("   成绩：")
+        try:
+            age_v = int(age) if age else None
+            score_v = float(score) if score else None
+        except ValueError:
+            print("   ❌ 年龄/成绩必须是数字")
+            return
+        ok, msg = self.db.add_student(student_id, name, gender, age_v, major, score_v)
+        print(f"   {'✅' if ok else '❌'} {msg}")
+
+    def _delete(self):
+        student_id = self._ask("   要删除的学号：")
+        ok, msg = self.db.delete_student(student_id)
+        print(f"   {'✅' if ok else '❌'} {msg}")
+
+    def _update(self):
+        student_id = self._ask("   要修改的学号：")
+        row = self.db.get_by_id(student_id)
+        if not row:
+            print("   ❌ 未找到该学号")
+            return
+        print(f"   当前信息：{row}")
+        print("   输入新值，不修改直接回车跳过")
+        fields = {}
+        for label, key in [("姓名", "name"), ("性别", "gender"),
+                           ("年龄", "age"), ("专业", "major"), ("成绩", "score")]:
+            val = self._ask(f"   新{label}：")
+            if val:
+                if key == "age":
+                    val = int(val)
+                elif key == "score":
+                    val = float(val)
+                fields[key] = val
+        ok, msg = self.db.update_student(student_id, **fields)
+        print(f"   {'✅' if ok else '❌'} {msg}")
+
+    def _list_all(self):
+        print("\n   ---- 所有学生 ----")
+        self._print_rows(self.db.get_all())
+
+    def _search(self):
+        kw = self._ask("   输入学号或姓名关键词：")
+        rows = self.db.search(kw)
+        print(f"\n   ---- 搜索结果（{len(rows)} 条）----")
+        self._print_rows(rows)
+
+    def _stats(self):
+        s = self.db.get_stats()
+        if not s:
+            print("   （暂无数据）")
+            return
+        print("\n   ---- 成绩统计 ----")
+        print(f"   总人数：{s['count']}")
+        print(f"   平均分：{s['avg']}")
+        print(f"   最高分：{s['max']}")
+        print(f"   最低分：{s['min']}")
+        print(f"   及格率：{s['pass_rate']}%")
+
+    def _ranking(self):
+        rows = self.db.get_ranking()
+        if not rows:
+            print("   （暂无数据）")
+            return
+        print("\n   ---- 成绩排名 ----")
+        print("   " + "-" * 32)
+        print(f"   {'排名':<6}{'学号':<14}{'姓名':<10}{'成绩':<6}")
+        print("   " + "-" * 32)
+        for i, (sid, name, score) in enumerate(rows, 1):
+            s = score if score is not None else 0
+            print(f"   {i:<6}{sid:<14}{name:<10}{s:<6}")
+        print("   " + "-" * 32)
+
+    def _export(self):
+        fmt = self._ask("   导出格式（1=Excel / 2=CSV）：") or "1"
+        rows = self.db.get_all()
+        if not rows:
+            print("   （暂无数据可导出）")
+            return
+        if fmt == "1":
+            path = Exporter.to_excel(rows)
+        else:
+            path = Exporter.to_csv(rows)
+        print(f"   ✅ 已导出：{os.path.abspath(path)}")
+
+
+if __name__ == "__main__":
+    app = StudentManagerApp()
+    app.run()
